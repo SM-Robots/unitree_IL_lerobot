@@ -1,4 +1,4 @@
-"""Convert Matrix sim recordings to LeRobot v2 dataset format.
+"""Convert g1-control-api recordings to LeRobot v3 dataset format.
 
 Our recorder (g1_control.recorder.DataRecorder) writes per-episode parquet files
 with 29-DOF joint data plus separate hand arrays, and per-camera MP4 videos.
@@ -6,10 +6,13 @@ This script extracts the 14 upper-body arm joints + 14 hand joints = 28 DOF,
 decodes video frames, and feeds everything through LeRobotDataset.create() /
 add_frame() / save_episode().
 
+Supports multiple recording directories — episodes from all dirs are merged
+into a single dataset.
+
 Usage:
     python unitree_lerobot/utils/convert_matrix_to_lerobot.py \
-        --recording-dir /path/to/recordings/episode_20260220_213422 \
-        --repo-id local/sim_pick_cup \
+        --recording-dirs /path/to/session1 /path/to/session2 \
+        --repo-id local/real_pick_cup \
         --fps 50
 """
 
@@ -40,35 +43,39 @@ UPPER_BODY_INDICES = list(range(15, 29))  # 14 arm DOFs
 
 @dataclass
 class ConvertArgs:
-    recording_dir: str
-    """Path to a Matrix recording directory (contains meta/, data/, videos/)."""
+    recording_dirs: list[str]
+    """Paths to recording directories (each contains meta/, data/, videos/)."""
     repo_id: str = "local/sim_pick_cup"
     """LeRobot dataset repo-id (local/ prefix keeps it local)."""
     fps: int = 50
     """Recording FPS (must match the original recording rate)."""
     task: str = "Pick up the cup."
     """Task description string stored in every frame."""
-    robot_type: str = "Unitree_G1_Dex3_Sim_Realsense"
+    robot_type: str = "Unitree_G1_Real_Realsense"
     """Robot config key in constants.py."""
     cameras: list[str] = field(default_factory=lambda: ["realsense"])
     """Which cameras to include (must exist in videos/ dir)."""
 
 
 def convert(args: ConvertArgs) -> None:
-    rec_dir = Path(args.recording_dir)
-    assert rec_dir.exists(), f"Recording dir not found: {rec_dir}"
+    rec_dirs = [Path(d) for d in args.recording_dirs]
+    for d in rec_dirs:
+        assert d.exists(), f"Recording dir not found: {d}"
 
-    # ── Read episode list ─────────────────────────────────────────────────
-    episodes_path = rec_dir / "meta" / "episodes.jsonl"
-    episodes = []
-    with open(episodes_path) as f:
-        for line in f:
-            if line.strip():
-                episodes.append(json.loads(line))
-    print(f"Found {len(episodes)} episodes in {rec_dir.name}")
+    # ── Collect episodes from all recording dirs ──────────────────────────
+    all_episodes: list[tuple[Path, dict]] = []  # (rec_dir, ep_meta)
+    for rec_dir in rec_dirs:
+        episodes_path = rec_dir / "meta" / "episodes.jsonl"
+        with open(episodes_path) as f:
+            ep_list = [json.loads(line) for line in f if line.strip()]
+        print(f"Found {len(ep_list)} episodes in {rec_dir.name}")
+        for ep in ep_list:
+            all_episodes.append((rec_dir, ep))
 
-    # ── Read info.json for video shapes ───────────────────────────────────
-    info = json.loads((rec_dir / "meta" / "info.json").read_text())
+    print(f"Total: {len(all_episodes)} episodes from {len(rec_dirs)} recording(s)")
+
+    # ── Read info.json for video shapes (from first recording) ────────────
+    info = json.loads((rec_dirs[0] / "meta" / "info.json").read_text())
 
     # ── Build features dict ───────────────────────────────────────────────
     motors = ROBOT_CONFIGS[args.robot_type].motors
@@ -115,7 +122,7 @@ def convert(args: ConvertArgs) -> None:
 
     total_frames = 0
 
-    for ep_meta in tqdm.tqdm(episodes, desc="Converting episodes"):
+    for rec_dir, ep_meta in tqdm.tqdm(all_episodes, desc="Converting episodes"):
         ep_idx = ep_meta["episode_index"]
 
         # ── Read parquet ──────────────────────────────────────────────────
@@ -123,20 +130,24 @@ def convert(args: ConvertArgs) -> None:
         table = pq.read_table(pq_path)
 
         joint_pos = np.array(table.column("joint_pos").to_pylist(), dtype=np.float32)
-        hand_left = np.array(table.column("hand_left").to_pylist(), dtype=np.float32)
-        hand_right = np.array(table.column("hand_right").to_pylist(), dtype=np.float32)
         action_29 = np.array(table.column("action").to_pylist(), dtype=np.float32)
 
         n_steps = len(joint_pos)
 
-        # ── Build 28-DOF vectors ──────────────────────────────────────────
-        # State: measured arm positions + hand targets
+        # ── Build state/action vectors ────────────────────────────────────
         arm_state = joint_pos[:, UPPER_BODY_INDICES]  # (N, 14)
-        state_28 = np.concatenate([arm_state, hand_left, hand_right], axis=1)  # (N, 28)
-
-        # Action: commanded arm targets + hand targets
         arm_action = action_29[:, UPPER_BODY_INDICES]  # (N, 14)
-        action_28 = np.concatenate([arm_action, hand_left, hand_right], axis=1)  # (N, 28)
+
+        if n_motors > 14:
+            # Include hand DOFs
+            hand_left = np.array(table.column("hand_left").to_pylist(), dtype=np.float32)
+            hand_right = np.array(table.column("hand_right").to_pylist(), dtype=np.float32)
+            state = np.concatenate([arm_state, hand_left, hand_right], axis=1)
+            action = np.concatenate([arm_action, hand_left, hand_right], axis=1)
+        else:
+            # Arm-only (14 DOF)
+            state = arm_state
+            action = arm_action
 
         # ── Decode video frames ───────────────────────────────────────────
         cam_frames: dict[str, list[np.ndarray]] = {}
@@ -168,16 +179,16 @@ def convert(args: ConvertArgs) -> None:
             n_steps,
             *(len(cam_frames[c]) for c in args.cameras),
         )
-        state_28 = state_28[:min_len]
-        action_28 = action_28[:min_len]
+        state = state[:min_len]
+        action = action[:min_len]
         for c in args.cameras:
             cam_frames[c] = cam_frames[c][:min_len]
 
         # ── Add frames to dataset ─────────────────────────────────────────
         for i in range(min_len):
             frame = {
-                "observation.state": state_28[i],
-                "action": action_28[i],
+                "observation.state": state[i],
+                "action": action[i],
                 "task": args.task,
             }
             for cam_name in args.cameras:
@@ -189,7 +200,7 @@ def convert(args: ConvertArgs) -> None:
 
     print(f"\nConversion complete!")
     print(f"  Output:   {output_path}")
-    print(f"  Episodes: {len(episodes)}")
+    print(f"  Episodes: {len(all_episodes)}")
     print(f"  Frames:   {total_frames}")
     print(f"  Motors:   {n_motors} ({', '.join(args.cameras)})")
     print(f"  FPS:      {args.fps}")

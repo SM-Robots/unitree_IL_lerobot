@@ -467,6 +467,32 @@ LIFT_G1_DEX1_NOUSEWAIST_CONFIG = RobotConfig(
     json_action_data_name=["left_arm.qpos", "right_arm.qpos", "torso.qvel", "left_ee.qpos", "right_ee.qpos"],
 )
 
+G1_REAL_REALSENSE_CONFIG = RobotConfig(
+    motors=[
+        "kLeftShoulderPitch",
+        "kLeftShoulderRoll",
+        "kLeftShoulderYaw",
+        "kLeftElbow",
+        "kLeftWristRoll",
+        "kLeftWristPitch",
+        "kLeftWristYaw",
+        "kRightShoulderPitch",
+        "kRightShoulderRoll",
+        "kRightShoulderYaw",
+        "kRightElbow",
+        "kRightWristRoll",
+        "kRightWristPitch",
+        "kRightWristYaw",
+    ],
+    cameras=[
+        "realsense",
+    ],
+    camera_to_image_key={"realsense": "realsense"},
+    json_state_data_name=[],
+    json_action_data_name=[],
+)
+
+
 G1_DEX3_SIM_REALSENSE_CONFIG = RobotConfig(
     motors=[
         "kLeftShoulderPitch",
@@ -520,4 +546,5 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_NoUseWaist": LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_G1_Dex3_Sim_Realsense": G1_DEX3_SIM_REALSENSE_CONFIG,
+    "Unitree_G1_Real_Realsense": G1_REAL_REALSENSE_CONFIG,
 }
